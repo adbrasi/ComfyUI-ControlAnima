@@ -1,7 +1,7 @@
 """
 IC-LoRA (In-Context LoRA) nodes for Anima in ComfyUI.
 
-Key difference from temporal concat (levzzz/AnimaReferenceLatent):
+Key difference from basic temporal concat (AnimaReferenceLatent):
 - Per-token timestep: reference frame gets t=0, target frame gets t=sigma
 - The model was TRAINED with this asymmetric timestep pattern
 - Standard Load LoRA works (IC-LoRA is PEFT standard)
