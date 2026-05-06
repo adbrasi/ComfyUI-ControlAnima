@@ -84,6 +84,80 @@ def _ease(t, curve):
 CURVE_OPTIONS = ['linear', 'ease_in', 'ease_out', 'ease_in_out', 'cosine']
 
 
+def _compute_step_progress(current_sigma, transformer_options):
+    """Compute sampling progress from the sampler step index when available."""
+    sample_sigmas = transformer_options.get("sample_sigmas", None)
+    if sample_sigmas is None:
+        return 0.0
+
+    total_steps = len(sample_sigmas) - 1
+    if total_steps <= 0:
+        return 0.0
+
+    current_sigmas = transformer_options.get("sigmas", None)
+    if current_sigmas is not None:
+        current_sigma_tensor = current_sigmas[0].to(device=sample_sigmas.device, dtype=sample_sigmas.dtype)
+        matches = torch.where(
+            torch.isclose(sample_sigmas, current_sigma_tensor, rtol=1e-4)
+        )[0]
+        if len(matches) > 0:
+            return matches[0].item() / total_steps
+
+    diffs = (sample_sigmas - current_sigma).abs()
+    return diffs.argmin().item() / total_steps
+
+
+def _match_batch(tensor, batch_size, name):
+    """Expand batch-1 tensors and fail clearly on incompatible batches."""
+    if tensor.shape[0] == batch_size:
+        return tensor
+    if tensor.shape[0] == 1:
+        return tensor.expand(batch_size, -1, -1, -1, -1)
+    raise ValueError(
+        f"[IC-LoRA] {name} batch size {tensor.shape[0]} does not match "
+        f"sampling batch size {batch_size}. Use batch 1 or the exact same batch size."
+    )
+
+
+def _prepare_timestep_tables(timesteps, batch_size, target_frames, ref_frames, device, dtype):
+    """Return (target timesteps, zero ref timesteps) with shape (B, T)."""
+    timesteps = timesteps.to(device=device, dtype=dtype)
+
+    if timesteps.ndim == 0:
+        t_target = timesteps.reshape(1, 1).expand(batch_size, target_frames)
+    elif timesteps.ndim == 1:
+        if timesteps.shape[0] == 1 and batch_size > 1:
+            timesteps = timesteps.expand(batch_size)
+        elif timesteps.shape[0] != batch_size:
+            raise ValueError(
+                f"[IC-LoRA] timestep batch size {timesteps.shape[0]} does not "
+                f"match sampling batch size {batch_size}."
+            )
+        t_target = timesteps.unsqueeze(1).expand(-1, target_frames)
+    elif timesteps.ndim == 2:
+        if timesteps.shape[0] == 1 and batch_size > 1:
+            timesteps = timesteps.expand(batch_size, -1)
+        elif timesteps.shape[0] != batch_size:
+            raise ValueError(
+                f"[IC-LoRA] timestep batch size {timesteps.shape[0]} does not "
+                f"match sampling batch size {batch_size}."
+            )
+        if timesteps.shape[1] == 1 and target_frames > 1:
+            t_target = timesteps.expand(-1, target_frames)
+        elif timesteps.shape[1] == target_frames:
+            t_target = timesteps
+        else:
+            raise ValueError(
+                f"[IC-LoRA] timestep frame count {timesteps.shape[1]} does not "
+                f"match target frame count {target_frames}."
+            )
+    else:
+        raise ValueError(f"[IC-LoRA] unsupported timestep shape: {tuple(timesteps.shape)}")
+
+    t_refs = torch.zeros(batch_size, ref_frames, device=device, dtype=dtype)
+    return t_target, t_refs
+
+
 # ============================================================================
 # V1 Node (legacy — for LoRAs trained with ic_lora mode)
 # ============================================================================
@@ -109,7 +183,7 @@ class AnimaICLoRAApply:
                 "model": ("MODEL",),
                 "ref_latent": ("LATENT", {"tooltip": "VAE-encoded reference image"}),
                 "ref_first": ("BOOLEAN", {"default": False,
-                                          "tooltip": "False (ic_lora/ic_lora_v2 training): [noise T=0, ref T=1]. True (ic_lora_full training): [ref T=0, noise T=1]. MUST match training order."}),
+                                          "tooltip": "False (legacy ic_lora training): [noise T=0, ref T=1]. True (ic_lora_full/V2 training): [ref T=0, noise T=1]. MUST match training order."}),
                 "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
                                             "tooltip": "Start applying at this % of sampling"}),
                 "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
@@ -426,14 +500,11 @@ def _register_ic_lora_wrapper(model_patcher):
         if ref_list is None and single_ref is None:
             return executor(*args, **kwargs)
 
-        # Track progress using sample_sigmas (reliable across runs)
+        # Track progress by sampler step. Sigma-space is non-linear for Anima.
         current_t = args[1].max().item()
-        sample_sigmas = kwargs.get("transformer_options", {}).get("sample_sigmas", None)
-        if sample_sigmas is not None:
-            max_sigma = sample_sigmas.max().item()
-            progress = 1.0 - (current_t / max_sigma) if max_sigma > 0 else 0.0
-        else:
-            progress = 0.0
+        progress = _compute_step_progress(
+            current_t, kwargs.get("transformer_options", {})
+        )
 
         start_pct = _options_ref.get("ic_lora_start_percent", 0.0)
         end_pct = _options_ref.get("ic_lora_end_percent", 1.0)
@@ -462,8 +533,7 @@ def _register_ic_lora_wrapper(model_patcher):
         prepared_refs = []
         for ref in refs:
             ref = ref.to(device=x.device, dtype=x.dtype)
-            if ref.shape[0] < x.shape[0]:
-                ref = ref.expand(x.shape[0], -1, -1, -1, -1)
+            ref = _match_batch(ref, x.shape[0], "reference latent")
             rh, rw = ref.shape[3], ref.shape[4]
             th, tw = x.shape[3], x.shape[4]
             if rh != th or rw != tw:
@@ -498,16 +568,10 @@ def _register_ic_lora_wrapper(model_patcher):
         ref_first = _options_ref.get("ic_lora_ref_first", False)
         orig_T = x.shape[2]
 
-        # Per-token timestep: refs get t=0, target gets t=sigma
-        if timesteps.ndim == 0:
-            timesteps = timesteps.unsqueeze(0)
-
-        if timesteps.ndim == 1:
-            t_refs = torch.zeros(timesteps.shape[0], n_refs, device=timesteps.device, dtype=timesteps.dtype)
-            t_target = timesteps.unsqueeze(1)  # (B, 1)
-        else:
-            t_refs = torch.zeros(timesteps.shape[0], n_refs, device=timesteps.device, dtype=timesteps.dtype)
-            t_target = timesteps
+        # Per-token timestep: refs get t=0, target gets t=sigma.
+        t_target, t_refs = _prepare_timestep_tables(
+            timesteps, x.shape[0], orig_T, n_refs, x.device, timesteps.dtype
+        )
 
         if ref_first:
             # [ref1, ref2, ..., refN, noise]

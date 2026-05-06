@@ -42,8 +42,9 @@ def _compute_step_progress(current_sigma, transformer_options):
     # Use torch.where like HunyuanVideo does
     current_sigmas = transformer_options.get("sigmas", None)
     if current_sigmas is not None:
+        current_sigma_tensor = current_sigmas[0].to(device=sample_sigmas.device, dtype=sample_sigmas.dtype)
         matches = torch.where(
-            torch.isclose(sample_sigmas, current_sigmas[0], rtol=1e-4)
+            torch.isclose(sample_sigmas, current_sigma_tensor, rtol=1e-4)
         )[0]
         if len(matches) > 0:
             step_index = matches[0].item()
@@ -53,6 +54,57 @@ def _compute_step_progress(current_sigma, transformer_options):
     diffs = (sample_sigmas - current_sigma).abs()
     step_index = diffs.argmin().item()
     return step_index / total_steps
+
+
+def _match_batch(tensor, batch_size, name):
+    """Expand batch-1 tensors and fail clearly on incompatible batches."""
+    if tensor.shape[0] == batch_size:
+        return tensor
+    if tensor.shape[0] == 1:
+        return tensor.expand(batch_size, -1, -1, -1, -1)
+    raise ValueError(
+        f"[OminiControl] {name} batch size {tensor.shape[0]} does not match "
+        f"sampling batch size {batch_size}. Use batch 1 or the exact same batch size."
+    )
+
+
+def _prepare_timestep_tables(timesteps, batch_size, target_frames, cond_frames, device, dtype):
+    """Return (target timesteps, zero condition timesteps) with shape (B, T)."""
+    timesteps = timesteps.to(device=device, dtype=dtype)
+
+    if timesteps.ndim == 0:
+        t_target = timesteps.reshape(1, 1).expand(batch_size, target_frames)
+    elif timesteps.ndim == 1:
+        if timesteps.shape[0] == 1 and batch_size > 1:
+            timesteps = timesteps.expand(batch_size)
+        elif timesteps.shape[0] != batch_size:
+            raise ValueError(
+                f"[OminiControl] timestep batch size {timesteps.shape[0]} does not "
+                f"match sampling batch size {batch_size}."
+            )
+        t_target = timesteps.unsqueeze(1).expand(-1, target_frames)
+    elif timesteps.ndim == 2:
+        if timesteps.shape[0] == 1 and batch_size > 1:
+            timesteps = timesteps.expand(batch_size, -1)
+        elif timesteps.shape[0] != batch_size:
+            raise ValueError(
+                f"[OminiControl] timestep batch size {timesteps.shape[0]} does not "
+                f"match sampling batch size {batch_size}."
+            )
+        if timesteps.shape[1] == 1 and target_frames > 1:
+            t_target = timesteps.expand(-1, target_frames)
+        elif timesteps.shape[1] == target_frames:
+            t_target = timesteps
+        else:
+            raise ValueError(
+                f"[OminiControl] timestep frame count {timesteps.shape[1]} does not "
+                f"match target frame count {target_frames}."
+            )
+    else:
+        raise ValueError(f"[OminiControl] unsupported timestep shape: {tuple(timesteps.shape)}")
+
+    t_cond = torch.zeros(batch_size, cond_frames, device=device, dtype=dtype)
+    return t_target, t_cond
 
 
 # ============================================================================
@@ -401,8 +453,7 @@ def _register_ominicontrol_wrapper(model_patcher):
         rest_args = list(args[2:])
 
         cond = cond_latents.to(device=x.device, dtype=x.dtype)
-        if cond.shape[0] < x.shape[0]:
-            cond = cond.expand(x.shape[0], -1, -1, -1, -1)
+        cond = _match_batch(cond, x.shape[0], "condition latent")
 
         if cond.shape[3] != x.shape[3] or cond.shape[4] != x.shape[4]:
             cond = torch.nn.functional.interpolate(
@@ -413,16 +464,13 @@ def _register_ominicontrol_wrapper(model_patcher):
         # --- Temporal concat: [noise_T0, condition_T1] ---
         x_concat = torch.cat([x, cond], dim=2)
         orig_T = x.shape[2]
+        cond_T = cond.shape[2]
 
         # Per-token timestep: target=sigma, condition=0
-        if timesteps.ndim == 0:
-            timesteps = timesteps.unsqueeze(0)
-        if timesteps.ndim == 1:
-            t_cond = torch.zeros_like(timesteps)
-            timesteps_2 = torch.stack([timesteps, t_cond], dim=1)
-        else:
-            t_cond = torch.zeros(timesteps.shape[0], 1, device=timesteps.device, dtype=timesteps.dtype)
-            timesteps_2 = torch.cat([timesteps, t_cond], dim=1)
+        t_target, t_cond = _prepare_timestep_tables(
+            timesteps, x.shape[0], orig_T, cond_T, x.device, timesteps.dtype
+        )
+        timesteps_2 = torch.cat([t_target, t_cond], dim=1)
 
         # --- RoPE hook for spatial mode ---
         hook_handle = None
