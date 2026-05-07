@@ -82,6 +82,7 @@ def _ease(t, curve):
 
 
 CURVE_OPTIONS = ['linear', 'ease_in', 'ease_out', 'ease_in_out', 'cosine']
+NEXT_SCENE_PROFILES = ['quality_scene', 'balanced', 'faithful', 'loose']
 
 
 def _compute_step_progress(current_sigma, transformer_options):
@@ -119,7 +120,7 @@ def _match_batch(tensor, batch_size, name):
     )
 
 
-def _prepare_timestep_tables(timesteps, batch_size, target_frames, ref_frames, device, dtype):
+def _prepare_timestep_tables(timesteps, batch_size, target_frames, ref_frames, device, dtype, ref_timestep=0.0):
     """Return (target timesteps, zero ref timesteps) with shape (B, T)."""
     timesteps = timesteps.to(device=device, dtype=dtype)
 
@@ -154,8 +155,55 @@ def _prepare_timestep_tables(timesteps, batch_size, target_frames, ref_frames, d
     else:
         raise ValueError(f"[IC-LoRA] unsupported timestep shape: {tuple(timesteps.shape)}")
 
-    t_refs = torch.zeros(batch_size, ref_frames, device=device, dtype=dtype)
+    t_refs = torch.full((batch_size, ref_frames), float(ref_timestep), device=device, dtype=dtype)
     return t_target, t_refs
+
+
+def _next_scene_profile_defaults(profile):
+    """Defaults tuned for next-scene IC-LoRA inference."""
+    defaults = {
+        'quality_scene': {
+            'start_percent': 0.0,
+            'end_percent': 0.78,
+            'fade_in': 0.0,
+            'fade_out': 0.22,
+            'curve': 'cosine',
+            'ref_weight': 0.92,
+            'ref_noise': 0.0,
+            'ref_timestep': 0.0,
+        },
+        'balanced': {
+            'start_percent': 0.0,
+            'end_percent': 0.86,
+            'fade_in': 0.0,
+            'fade_out': 0.16,
+            'curve': 'ease_in_out',
+            'ref_weight': 1.0,
+            'ref_noise': 0.0,
+            'ref_timestep': 0.0,
+        },
+        'faithful': {
+            'start_percent': 0.0,
+            'end_percent': 1.0,
+            'fade_in': 0.0,
+            'fade_out': 0.0,
+            'curve': 'linear',
+            'ref_weight': 1.0,
+            'ref_noise': 0.0,
+            'ref_timestep': 0.0,
+        },
+        'loose': {
+            'start_percent': 0.0,
+            'end_percent': 0.68,
+            'fade_in': 0.0,
+            'fade_out': 0.30,
+            'curve': 'cosine',
+            'ref_weight': 0.78,
+            'ref_noise': 0.015,
+            'ref_timestep': 0.01,
+        },
+    }
+    return defaults.get(profile, defaults['quality_scene'])
 
 
 # ============================================================================
@@ -437,6 +485,95 @@ class AnimaICLoRAV3Apply:
 
 
 # ============================================================================
+# Next Scene Node (specialized for Anima IC-LoRA V2 next-image editing)
+# ============================================================================
+
+class AnimaNextSceneV1Apply:
+    """Apply an Anima IC-LoRA V2 as a next-scene reference conditioner.
+
+    This node is intentionally stricter than the generic IC-LoRA nodes:
+    - ref_first is fixed to True (matches ic_lora_v2 training)
+    - latent resize is disabled by default to avoid quality loss
+    - strength is applied by scaling the reference latent, not by blending the
+      final output against an unconditioned pass
+    - the default schedule releases the reference before the final detail steps
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "ref_latent": ("LATENT", {"tooltip": "VAE-encoded previous/input scene. Best quality when it matches the generation resolution."}),
+                "profile": (NEXT_SCENE_PROFILES, {"default": "quality_scene",
+                                                  "tooltip": "quality_scene releases the reference before final detail steps. balanced keeps more continuity. faithful is strongest. loose allows more change."}),
+                "ref_weight": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.5, "step": 0.01,
+                                         "tooltip": "-1 uses the selected profile default. Lower values reduce reference pull without output blending."}),
+                "ref_noise": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 0.20, "step": 0.005,
+                                        "tooltip": "-1 uses the selected profile default. Keep near 0 for quality; small values loosen exact copying."}),
+                "ref_timestep": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 0.20, "step": 0.005,
+                                           "tooltip": "-1 uses the selected profile default. 0 matches training. Tiny values can loosen reference adherence."}),
+                "end_percent": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.01,
+                                          "tooltip": "-1 uses the selected profile default. Lower values release IC-LoRA before final detail steps."}),
+                "fade_out": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.01,
+                                       "tooltip": "-1 uses the selected profile default. Smoothly fades reference influence near end_percent."}),
+                "strict_size": ("BOOLEAN", {"default": True,
+                                            "tooltip": "Recommended. Errors on large size mismatch instead of bilinear-resizing the latent."}),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL", "IMAGE")
+    RETURN_NAMES = ("model", "schedule_preview")
+    FUNCTION = "apply"
+    CATEGORY = "conditioning/anima"
+
+    def apply(self, model, ref_latent, profile, ref_weight, ref_noise, ref_timestep,
+              end_percent, fade_out, strict_size):
+        defaults = _next_scene_profile_defaults(profile)
+        start_percent = defaults['start_percent']
+        actual_end = defaults['end_percent'] if end_percent < 0 else end_percent
+        fade_in = defaults['fade_in']
+        actual_fade_out = defaults['fade_out'] if fade_out < 0 else fade_out
+        curve = defaults['curve']
+        actual_ref_weight = defaults['ref_weight'] if ref_weight < 0 else ref_weight
+        actual_ref_noise = defaults['ref_noise'] if ref_noise < 0 else ref_noise
+        actual_ref_timestep = defaults['ref_timestep'] if ref_timestep < 0 else ref_timestep
+
+        model_clone = model.clone()
+
+        ref_samples = ref_latent["samples"]
+        if ref_samples.ndim == 4:
+            ref_samples = ref_samples.unsqueeze(2)
+
+        ref_samples = model_clone.model.process_latent_in(ref_samples)
+
+        if actual_ref_noise > 0:
+            noise = torch.randn_like(ref_samples)
+            ref_samples = (1.0 - actual_ref_noise) * ref_samples + actual_ref_noise * noise
+
+        existing_refs = model_clone.model_options.get("ic_lora_refs", [])
+        model_clone.model_options["ic_lora_refs"] = existing_refs + [ref_samples]
+        model_clone.model_options["ic_lora_ref_first"] = True
+        model_clone.model_options["ic_lora_start_percent"] = start_percent
+        model_clone.model_options["ic_lora_end_percent"] = actual_end
+        model_clone.model_options["ic_lora_fade_in"] = fade_in
+        model_clone.model_options["ic_lora_fade_out"] = actual_fade_out
+        model_clone.model_options["ic_lora_curve"] = curve
+        model_clone.model_options["ic_lora_strict_size"] = strict_size
+        model_clone.model_options["ic_lora_blend_mode"] = "latent_scale"
+        model_clone.model_options["ic_lora_ref_weight"] = actual_ref_weight
+        model_clone.model_options["ic_lora_ref_timestep"] = actual_ref_timestep
+
+        _register_ic_lora_wrapper(model_clone)
+
+        preview = _render_curve_preview(
+            start_percent, actual_end, fade_in, actual_fade_out, curve
+        )
+
+        return (model_clone, preview)
+
+
+# ============================================================================
 # Latent crop/pad utility (avoids bilinear interpolation artifacts)
 # ============================================================================
 
@@ -511,6 +648,9 @@ def _register_ic_lora_wrapper(model_patcher):
         fade_in = _options_ref.get("ic_lora_fade_in", 0.0)
         fade_out = _options_ref.get("ic_lora_fade_out", 0.0)
         curve = _options_ref.get("ic_lora_curve", "linear")
+        blend_mode = _options_ref.get("ic_lora_blend_mode", "output")
+        ref_weight = _options_ref.get("ic_lora_ref_weight", 1.0)
+        ref_timestep = _options_ref.get("ic_lora_ref_timestep", 0.0)
 
         strength = _schedule_strength(progress, start_pct, end_pct, fade_in, fade_out, curve)
 
@@ -559,6 +699,8 @@ def _register_ic_lora_wrapper(model_patcher):
                         size=(th, tw),
                         mode='bilinear', align_corners=False,
                     ).unsqueeze(2)
+            if blend_mode == "latent_scale":
+                ref = ref * max(0.0, ref_weight * strength)
             prepared_refs.append(ref)
 
         # Concatenate all refs along T dimension: (B, C, N_refs, H, W)
@@ -570,7 +712,8 @@ def _register_ic_lora_wrapper(model_patcher):
 
         # Per-token timestep: refs get t=0, target gets t=sigma.
         t_target, t_refs = _prepare_timestep_tables(
-            timesteps, x.shape[0], orig_T, n_refs, x.device, timesteps.dtype
+            timesteps, x.shape[0], orig_T, n_refs, x.device, timesteps.dtype,
+            ref_timestep=ref_timestep,
         )
 
         if ref_first:
@@ -594,8 +737,9 @@ def _register_ic_lora_wrapper(model_patcher):
             else:
                 output_with_ref = output_with_ref[:, :, :orig_T, :, :]
 
-        # Apply strength blending
-        if strength >= 1.0:
+        # Apply strength blending. Next-scene mode scales the reference latent
+        # before the forward pass and does not blend final outputs.
+        if blend_mode == "latent_scale" or strength >= 1.0:
             return output_with_ref
 
         # Partial strength: blend with unconditional output.
@@ -624,10 +768,12 @@ NODE_CLASS_MAPPINGS = {
     "AnimaICLoRAApply": AnimaICLoRAApply,
     "AnimaICLoRAV2Apply": AnimaICLoRAV2Apply,
     "AnimaICLoRAV3Apply": AnimaICLoRAV3Apply,
+    "AnimaNextSceneV1Apply": AnimaNextSceneV1Apply,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AnimaICLoRAApply": "Anima IC-LoRA Apply",
     "AnimaICLoRAV2Apply": "Anima IC-LoRA V2 Apply",
     "AnimaICLoRAV3Apply": "Anima IC-LoRA V3 Apply",
+    "AnimaNextSceneV1Apply": "Anima Next Scene V1",
 }
