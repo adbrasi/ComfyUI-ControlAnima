@@ -83,6 +83,9 @@ def _ease(t, curve):
 
 CURVE_OPTIONS = ['linear', 'ease_in', 'ease_out', 'ease_in_out', 'cosine']
 NEXT_SCENE_PROFILES = ['quality_scene', 'balanced', 'faithful', 'loose']
+NEXT_SCENE_CURVE_OPTIONS = ['profile_default'] + CURVE_OPTIONS
+NEXT_SCENE_STRENGTH_MODES = ['latent_scale', 'output_blend', 'full_condition']
+NEXT_SCENE_RESIZE_POLICIES = ['strict', 'crop_pad', 'resize']
 
 
 def _compute_step_progress(current_sigma, transformer_options):
@@ -507,18 +510,28 @@ class AnimaNextSceneV1Apply:
                 "ref_latent": ("LATENT", {"tooltip": "VAE-encoded previous/input scene. Best quality when it matches the generation resolution."}),
                 "profile": (NEXT_SCENE_PROFILES, {"default": "quality_scene",
                                                   "tooltip": "quality_scene releases the reference before final detail steps. balanced keeps more continuity. faithful is strongest. loose allows more change."}),
+                "strength_mode": (NEXT_SCENE_STRENGTH_MODES, {"default": "latent_scale",
+                                                              "tooltip": "latent_scale scales the reference before one forward pass. output_blend blends conditioned/unconditioned outputs. full_condition uses full conditioned output while active."}),
                 "ref_weight": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.5, "step": 0.01,
                                          "tooltip": "-1 uses the selected profile default. Lower values reduce reference pull without output blending."}),
                 "ref_noise": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 0.20, "step": 0.005,
                                         "tooltip": "-1 uses the selected profile default. Keep near 0 for quality; small values loosen exact copying."}),
                 "ref_timestep": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 0.20, "step": 0.005,
                                            "tooltip": "-1 uses the selected profile default. 0 matches training. Tiny values can loosen reference adherence."}),
+                "start_percent": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.01,
+                                            "tooltip": "-1 uses the selected profile default. Start applying IC-LoRA at this sampler progress."}),
                 "end_percent": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.01,
                                           "tooltip": "-1 uses the selected profile default. Lower values release IC-LoRA before final detail steps."}),
+                "fade_in": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.01,
+                                      "tooltip": "-1 uses the selected profile default. Smoothly ramps reference influence after start_percent."}),
                 "fade_out": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.01,
                                        "tooltip": "-1 uses the selected profile default. Smoothly fades reference influence near end_percent."}),
+                "curve": (NEXT_SCENE_CURVE_OPTIONS, {"default": "profile_default",
+                                                     "tooltip": "Easing curve for fade-in/fade-out. profile_default uses the selected profile."}),
+                "resize_policy": (NEXT_SCENE_RESIZE_POLICIES, {"default": "strict",
+                                                               "tooltip": "strict errors on large mismatch. crop_pad never interpolates but may crop. resize uses bilinear latent resize."}),
                 "strict_size": ("BOOLEAN", {"default": True,
-                                            "tooltip": "Recommended. Errors on large size mismatch instead of bilinear-resizing the latent."}),
+                                            "tooltip": "Compatibility switch. When true and resize_policy is strict, errors on large size mismatch."}),
             }
         }
 
@@ -527,14 +540,15 @@ class AnimaNextSceneV1Apply:
     FUNCTION = "apply"
     CATEGORY = "conditioning/anima"
 
-    def apply(self, model, ref_latent, profile, ref_weight, ref_noise, ref_timestep,
-              end_percent, fade_out, strict_size):
+    def apply(self, model, ref_latent, profile, strength_mode, ref_weight, ref_noise,
+              ref_timestep, start_percent, end_percent, fade_in, fade_out, curve,
+              resize_policy, strict_size):
         defaults = _next_scene_profile_defaults(profile)
-        start_percent = defaults['start_percent']
+        actual_start = defaults['start_percent'] if start_percent < 0 else start_percent
         actual_end = defaults['end_percent'] if end_percent < 0 else end_percent
-        fade_in = defaults['fade_in']
+        actual_fade_in = defaults['fade_in'] if fade_in < 0 else fade_in
         actual_fade_out = defaults['fade_out'] if fade_out < 0 else fade_out
-        curve = defaults['curve']
+        actual_curve = defaults['curve'] if curve == 'profile_default' else curve
         actual_ref_weight = defaults['ref_weight'] if ref_weight < 0 else ref_weight
         actual_ref_noise = defaults['ref_noise'] if ref_noise < 0 else ref_noise
         actual_ref_timestep = defaults['ref_timestep'] if ref_timestep < 0 else ref_timestep
@@ -554,20 +568,21 @@ class AnimaNextSceneV1Apply:
         existing_refs = model_clone.model_options.get("ic_lora_refs", [])
         model_clone.model_options["ic_lora_refs"] = existing_refs + [ref_samples]
         model_clone.model_options["ic_lora_ref_first"] = True
-        model_clone.model_options["ic_lora_start_percent"] = start_percent
+        model_clone.model_options["ic_lora_start_percent"] = actual_start
         model_clone.model_options["ic_lora_end_percent"] = actual_end
-        model_clone.model_options["ic_lora_fade_in"] = fade_in
+        model_clone.model_options["ic_lora_fade_in"] = actual_fade_in
         model_clone.model_options["ic_lora_fade_out"] = actual_fade_out
-        model_clone.model_options["ic_lora_curve"] = curve
+        model_clone.model_options["ic_lora_curve"] = actual_curve
         model_clone.model_options["ic_lora_strict_size"] = strict_size
-        model_clone.model_options["ic_lora_blend_mode"] = "latent_scale"
+        model_clone.model_options["ic_lora_resize_policy"] = resize_policy
+        model_clone.model_options["ic_lora_blend_mode"] = strength_mode
         model_clone.model_options["ic_lora_ref_weight"] = actual_ref_weight
         model_clone.model_options["ic_lora_ref_timestep"] = actual_ref_timestep
 
         _register_ic_lora_wrapper(model_clone)
 
         preview = _render_curve_preview(
-            start_percent, actual_end, fade_in, actual_fade_out, curve
+            actual_start, actual_end, actual_fade_in, actual_fade_out, actual_curve
         )
 
         return (model_clone, preview)
@@ -651,6 +666,7 @@ def _register_ic_lora_wrapper(model_patcher):
         blend_mode = _options_ref.get("ic_lora_blend_mode", "output")
         ref_weight = _options_ref.get("ic_lora_ref_weight", 1.0)
         ref_timestep = _options_ref.get("ic_lora_ref_timestep", 0.0)
+        resize_policy = _options_ref.get("ic_lora_resize_policy", None)
 
         strength = _schedule_strength(progress, start_pct, end_pct, fade_in, fade_out, curve)
 
@@ -670,6 +686,8 @@ def _register_ic_lora_wrapper(model_patcher):
 
         # Prepare all references: move to device, expand batch, handle spatial dims
         strict_size = _options_ref.get("ic_lora_strict_size", False)
+        if resize_policy is None:
+            resize_policy = "strict" if strict_size else "resize"
         prepared_refs = []
         for ref in refs:
             ref = ref.to(device=x.device, dtype=x.dtype)
@@ -677,7 +695,7 @@ def _register_ic_lora_wrapper(model_patcher):
             rh, rw = ref.shape[3], ref.shape[4]
             th, tw = x.shape[3], x.shape[4]
             if rh != th or rw != tw:
-                if strict_size:
+                if resize_policy == "strict":
                     # V3 mode: no bilinear resize. Use center crop/pad for small
                     # differences (VAE rounding), error for large mismatches.
                     max_diff = max(abs(rh - th), abs(rw - tw))
@@ -692,8 +710,10 @@ def _register_ic_lora_wrapper(model_patcher):
                         )
                     # Small difference (<=4 latent px): center crop/pad without interpolation
                     ref = _crop_or_pad_to(ref, th, tw)
+                elif resize_policy == "crop_pad":
+                    ref = _crop_or_pad_to(ref, th, tw)
                 else:
-                    # V1/V2 mode: bilinear resize (legacy)
+                    # V1/V2 mode or explicit Next Scene resize: bilinear resize.
                     ref = torch.nn.functional.interpolate(
                         ref.squeeze(2),
                         size=(th, tw),
@@ -701,6 +721,8 @@ def _register_ic_lora_wrapper(model_patcher):
                     ).unsqueeze(2)
             if blend_mode == "latent_scale":
                 ref = ref * max(0.0, ref_weight * strength)
+            elif blend_mode in ("output_blend", "full_condition"):
+                ref = ref * max(0.0, ref_weight)
             prepared_refs.append(ref)
 
         # Concatenate all refs along T dimension: (B, C, N_refs, H, W)
@@ -739,7 +761,7 @@ def _register_ic_lora_wrapper(model_patcher):
 
         # Apply strength blending. Next-scene mode scales the reference latent
         # before the forward pass and does not blend final outputs.
-        if blend_mode == "latent_scale" or strength >= 1.0:
+        if blend_mode in ("latent_scale", "full_condition") or strength >= 1.0:
             return output_with_ref
 
         # Partial strength: blend with unconditional output.
